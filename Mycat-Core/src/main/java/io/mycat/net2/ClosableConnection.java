@@ -24,7 +24,7 @@
 package io.mycat.net2;
 
 public interface ClosableConnection {
-	String getCharset();
+	
 	/**
 	 * 关闭连接
 	 */

@@ -1,11 +1,11 @@
 package io.mycat.net2;
 
+import io.mycat.util.StringUtil;
+
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
-import java.util.concurrent.locks.ReentrantLock;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,17 +14,19 @@ import org.slf4j.LoggerFactory;
  * @author wuzh
  */
 public abstract class Connection implements ClosableConnection {
+	public static final int STATE_CONNECTING=0;
+	public static final int STATE_IDLE=1;
+	public static final int STATE_CLOSING=-1;
+	public static final int STATE_CLOSED=-2;
+	
     public static Logger LOGGER = LoggerFactory.getLogger(Connection.class);
     protected String host;
     protected int port;
     protected int localPort;
     protected long id;
-
-    public enum State {
-        connecting, connected, closing, closed, failed
-    }
-
-    private State state = State.connecting;
+    private String  reactor;
+    private Object attachement;
+    private int state = STATE_CONNECTING;
 
     // 连接的方向，in表示是客户端连接过来的，out表示自己作为客户端去连接对端Sever
     public enum Direction {
@@ -53,7 +55,6 @@ public abstract class Connection implements ClosableConnection {
     private long lastPerfCollectTime;
     @SuppressWarnings("rawtypes")
     protected NIOHandler handler;
-    private ReactorBufferPool myBufferPool;
 
     public Connection(SocketChannel channel) {
         this.channel = channel;
@@ -145,14 +146,7 @@ public abstract class Connection implements ClosableConnection {
         return netOutBytes;
     }
 
-    private ByteBuffer allocate() {
-        return NetSystem.getInstance().getBufferPool().allocate();
-    }
-
-    private final void recycle(ByteBuffer buffer) {
-        NetSystem.getInstance().getBufferPool().recycle(buffer);
-    }
-
+    
     public void setHandler(NIOHandler<? extends Connection> handler) {
         this.handler = handler;
 
@@ -169,7 +163,7 @@ public abstract class Connection implements ClosableConnection {
 
  
     public boolean isConnected() {
-        return (this.state == Connection.State.connected);
+        return (this.state != STATE_CONNECTING && state!=STATE_CLOSING && state!=STATE_CLOSED );
     }
 
 
@@ -267,13 +261,22 @@ public abstract class Connection implements ClosableConnection {
 
 
 
-    @SuppressWarnings("unchecked")
+  	public void setNIOReactor(String reactorName) {
+		this.reactor = reactorName;
+	}
+
+	@SuppressWarnings("unchecked")
     public void register(Selector selector, ReactorBufferPool myBufferPool) throws IOException {
-        this.myBufferPool = myBufferPool;
         processKey = channel.register(selector, SelectionKey.OP_READ, this);
         NetSystem.getInstance().addConnection(this);
-        this.readDataBuffer =new MappedFileConDataBuffer(id+".rtmp");
-        writeDataBuffer=new MappedFileConDataBuffer(id+".wtmp");
+       // boolean isLinux=GenelUtil.isLinuxSystem();
+        //String maprFileName=isLinux? "/dev/zero":id+".rtmp";
+        //String mapwFileName=isLinux? "/dev/zero":id+".wtmp";
+        String maprFileName=id+".rtmp";
+        String mapwFileName=id+".wtmp";
+        LOGGER.info("connection bytebuffer mapped "+maprFileName);
+        this.readDataBuffer =new MappedFileConDataBuffer(maprFileName); // 2 ,3 
+        writeDataBuffer=new MappedFileConDataBuffer3(mapwFileName);
         this.handler.onConnected(this);
 
     }
@@ -311,12 +314,21 @@ public abstract class Connection implements ClosableConnection {
     }
 
     private boolean write0() throws IOException {
-    	int written =this.writeDataBuffer.transferTo(this.channel);
-    	System.out.println("writed  "+written);
-		 netOutBytes += written;
-        NetSystem.getInstance().addNetOutBytes(written);
-       return (writeDataBuffer.readPos()==writeDataBuffer.writingPos());
-       
+    	final NetSystem nets = NetSystem.getInstance();
+    	final ConDataBuffer buffer = this.writeDataBuffer;
+    	final int written = buffer.transferTo(this.channel);
+    	final int remains = buffer.writingPos() - buffer.readPos();
+    	netOutBytes += written;
+		nets.addNetOutBytes(written);
+    	// trace-protocol
+    	// @author little-pan
+    	// @since 2016-09-29
+    	if(nets.getNetConfig().isTraceProtocol()){
+    		final String hexs = StringUtil.dumpAsHex(buffer, buffer.readPos() - written, written);
+    		LOGGER.info("C#{}B#{}: last writed = {} bytes, remain to write = {} bytes, written bytes\n{}", 
+    			getId(), buffer.hashCode(), written, remains, hexs);
+    	}
+    	return (remains == 0);
     }
 
     private void disableWrite() {
@@ -326,7 +338,6 @@ public abstract class Connection implements ClosableConnection {
         } catch (Exception e) {
             LOGGER.warn("can't disable write " + e + " con " + this);
         }
-
     }
 
     public void enableWrite(boolean wakeup) {
@@ -344,7 +355,13 @@ public abstract class Connection implements ClosableConnection {
         }
     }
 
-    public void disableRead() {
+    public Object getAttachement() {
+		return attachement;
+	}
+	public void setAttachement(Object attachement) {
+		this.attachement = attachement;
+	}
+	public void disableRead() {
 
         SelectionKey key = this.processKey;
         key.interestOps(key.interestOps() & OP_NOT_READ);
@@ -365,7 +382,7 @@ public abstract class Connection implements ClosableConnection {
         }
     }
 
-    public void setState(State newState) {
+    public void setState(int newState) {
         this.state = newState;
     }
 
@@ -374,30 +391,46 @@ public abstract class Connection implements ClosableConnection {
      * 
      * @throws IOException
      */
-    protected void asynRead() throws IOException {
-        if (this.isClosed) {
+    @SuppressWarnings("unchecked")
+	protected void asynRead() throws IOException {
+    	final ConDataBuffer buffer = readDataBuffer;
+    	if(LOGGER.isDebugEnabled()){
+    		LOGGER.debug("C#{}B#{} ready to read data", getId(), buffer.hashCode());
+    	}
+        if (isClosed()) {
+        	LOGGER.debug("Connection closed: ignore");
             return;
         }
-        int got =  (int) readDataBuffer.transferFrom(channel);
-            switch (got) {
+        final int got =  buffer.transferFrom(channel);
+        if(LOGGER.isDebugEnabled()){
+        	LOGGER.debug("C#{}B#{} can read {} bytes", getId(), buffer.hashCode(), got);
+        }
+        switch (got) {
             case 0: {
                 // 如果空间不够了，继续分配空间读取
                 if (readDataBuffer.isFull()) {
-                    //todo extends
+                    // @todo extends
                 }
                 break;
             }
             case -1: {
+            	close("client closed");
                 break;
             }
             default: {// readed some bytes
-
+            	// trace network protocol stream
+            	final NetSystem nets = NetSystem.getInstance();
+            	if(nets.getNetConfig().isTraceProtocol()){
+            		final int offset = buffer.readPos(), length = buffer.writingPos() - offset;
+            		final String hexs= StringUtil.dumpAsHex(buffer, offset, length);
+            		LOGGER.info("C#{}B#{}: last readed = {} bytes, total readed = {} bytes, buffer bytes\n{}", 
+            			getId(), buffer.hashCode(), got, length, hexs);
+            	}
                 // 子类负责解析报文并处理
-            	LOGGER.info("readed "+got);
                 handler.handleReadEvent(this);
             }
-            }
-           }
+     	}
+ 	}
 
         private void closeSocket() {
 
@@ -420,7 +453,7 @@ public abstract class Connection implements ClosableConnection {
 		return readDataBuffer;
 	}
 
-	public State getState() {
+	public int getState() {
         return state;
     }
 
@@ -447,10 +480,12 @@ public abstract class Connection implements ClosableConnection {
                 + direction + ", startupTime=" + startupTime + ", lastReadTime=" + lastReadTime + ", lastWriteTime="
                 + lastWriteTime + "]";
     }
-
-   
-    public ReactorBufferPool getMyBufferPool() {
-        return myBufferPool;
+    public String getReactor()
+    {
+    	return this.reactor;
     }
-
+	public boolean belongsActor(String reacotr) {
+		return reactor.equals(reacotr);
+	}
+  
 }
